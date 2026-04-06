@@ -1,14 +1,23 @@
 # arc2zen
 
-Migrate Arc Browser spaces and tabs to Zen Browser.
+Migrate Arc Browser to Zen Browser — spaces, tabs, and archived tabs.
 
-Transfers all spaces with their icons and theme colors, pinned tabs per space, unpinned tabs, and cross-space essential tabs (the ones pinned across all spaces in Arc).
+## What gets migrated
+
+| Arc | Zen |
+|-----|-----|
+| Spaces | Workspaces with matching icon + gradient color |
+| Space emoji icon | Workspace icon |
+| Pinned tabs per space | Pinned tabs per workspace |
+| Unpinned tabs per space | Regular tabs per workspace |
+| Global pinned tabs (across all spaces) | Essential tabs (across all workspaces) |
+| Archived tabs (2000+) | Bookmarks › Arc Archive folder |
 
 ## Requirements
 
-- macOS (Arc and Zen paths are auto-detected)
+- macOS (paths are auto-detected)
 - Python 3.10+
-- Zen Browser must be fully closed before running
+- **Zen must be fully closed (`Cmd+Q`) before running**
 
 ## Install
 
@@ -16,67 +25,45 @@ Transfers all spaces with their icons and theme colors, pinned tabs per space, u
 pip install lz4
 ```
 
-Or with a virtualenv:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install lz4
-```
-
 ## Usage
-
-Close Zen completely (`Cmd+Q`), then run:
 
 ```bash
 python3 arc2zen.py
 ```
 
-That's it. Arc and Zen are auto-detected. A backup of your existing Zen session is saved to your Zen profile directory before anything is written.
+Arc and Zen are auto-detected on macOS. A timestamped backup of your Zen session is saved before anything is written.
 
-### Options
+## Options
 
 ```
---dry-run        Preview what will be migrated without writing anything
+--dry-run        Preview without writing anything
 --overwrite      Re-import spaces that already exist in Zen
---verbose, -v    List every tab as it's migrated
---arc PATH       Path to Arc's StorableSidebar.json (if not auto-detected)
---zen PATH       Path to your Zen profile directory (if not auto-detected)
+--no-spaces      Skip spaces and tabs, only migrate archive
+--no-archive     Skip archived tabs, only migrate spaces and tabs
+--verbose, -v    List every tab being migrated
+--arc PATH       Path to Arc's application support directory
+--zen PATH       Path to your Zen profile directory
 ```
 
-### Examples
+## Examples
 
 ```bash
-# Preview first
+# Preview everything
 python3 arc2zen.py --dry-run
 
-# Full migration with tab list
-python3 arc2zen.py --verbose
+# Migrate spaces only (skip the 2000+ archived tabs)
+python3 arc2zen.py --no-archive
 
-# Re-run and overwrite previously imported spaces
+# Migrate archive only
+python3 arc2zen.py --no-spaces
+
+# Force re-import spaces that already exist
 python3 arc2zen.py --overwrite
 ```
 
-## What gets migrated
-
-| Arc | Zen |
-|-----|-----|
-| Spaces | Workspaces |
-| Space emoji icon | Workspace icon |
-| Space theme color | Workspace gradient |
-| Pinned tabs per space | Pinned tabs per workspace |
-| Unpinned tabs per space | Regular tabs per workspace |
-| Global pinned tabs (across all spaces) | Essential tabs (across all workspaces) |
-
 ## What doesn't migrate
 
-- Tab history (only the current URL per tab)
-- Archived tabs
-- Boosts
-- Notes
-- Easel
-
-## Tested on
-
-- Arc 1.x (macOS)
-- Zen 1.x (macOS)
+- Tab browsing history
+- Boosts (custom CSS/JS per site)
+- Notes and Easel content
+- Local file tabs (`file://`)
