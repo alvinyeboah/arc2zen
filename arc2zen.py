@@ -1,17 +1,7 @@
 #!/usr/bin/env python3
-"""
-arc2zen — Migrate Arc Browser spaces and tabs to Zen Browser.
-"""
+"""arc2zen — Migrate Arc Browser spaces and tabs to Zen Browser."""
 
-import argparse
-import glob
-import json
-import os
-import shutil
-import struct
-import sys
-import time
-import uuid
+import argparse, json, os, shutil, struct, sys, time, uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -20,371 +10,237 @@ try:
 except ImportError:
     sys.exit("Missing dependency: pip install lz4")
 
+MAGIC = b"mozLz40\0"
 
-# ── mozlz4 helpers ────────────────────────────────────────────────────────────
-
-MOZLZ4_MAGIC = b"mozLz40\0"
-
-def read_mozlz4(path: Path) -> tuple[bytes, dict]:
+def read_lz4(path):
     with open(path, "rb") as f:
         magic = f.read(8)
-        if magic != MOZLZ4_MAGIC:
-            raise ValueError(f"{path.name} is not a valid mozlz4 file")
         size = struct.unpack("<I", f.read(4))[0]
-        return magic, json.loads(lz4.block.decompress(f.read(), uncompressed_size=size).decode("utf-8"))
+        return magic, json.loads(lz4.block.decompress(f.read(), uncompressed_size=size))
 
-def write_mozlz4(path: Path, magic: bytes, obj: dict) -> None:
-    data = json.dumps(obj).encode("utf-8")
+def write_lz4(path, magic, obj):
+    data = json.dumps(obj).encode()
     with open(path, "wb") as f:
         f.write(magic)
         f.write(struct.pack("<I", len(data)))
         f.write(lz4.block.compress(data, store_size=False))
 
-
-# ── Path detection ────────────────────────────────────────────────────────────
-
-def find_arc_sidebar() -> Path:
+def find_arc():
     p = Path.home() / "Library/Application Support/Arc/StorableSidebar.json"
     if not p.exists():
-        raise FileNotFoundError(f"Arc sidebar not found at {p}\nIs Arc installed?")
+        sys.exit("Arc's StorableSidebar.json not found. Is Arc installed?")
     return p
 
-def find_zen_profile() -> Path:
+def find_zen():
     base = Path.home() / "Library/Application Support/Zen/Profiles"
     if not base.exists():
-        raise FileNotFoundError(f"Zen profiles not found at {base}\nIs Zen installed?")
-    profiles = sorted(base.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    profiles = [p for p in profiles if (p / "zen-sessions.jsonlz4").exists()]
+        sys.exit("Zen profiles not found. Is Zen installed?")
+    profiles = [p for p in sorted(base.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+                if (p / "zen-sessions.jsonlz4").exists()]
     if not profiles:
-        raise FileNotFoundError("No Zen profile with zen-sessions.jsonlz4 found")
+        sys.exit("No Zen profile found.")
     return profiles[0]
 
-
-# ── Arc parsing ───────────────────────────────────────────────────────────────
-
-def parse_arc(sidebar_path: Path) -> tuple[list, list, dict]:
-    """Returns (spaces, global_pinned_tabs, items_map)."""
-    with open(sidebar_path) as f:
-        data = json.load(f)
-
-    sidebar = data["sidebar"]["containers"][1]
-
-    # Parse items (alternating: uuid-string, object, ...)
-    items: dict[str, dict] = {}
-    for entry in sidebar["items"]:
+def parse_items(raw):
+    items = {}
+    for entry in raw:
         if isinstance(entry, dict):
             items[entry["id"]] = entry
+    return items
 
-    # Parse spaces
-    spaces = []
-    for entry in sidebar["spaces"]:
-        if isinstance(entry, dict):
-            spaces.append(entry)
-
-    # Find global pinned container: item with no parent and type itemContainer
-    # holding tabs like Claude, ChatGPT etc.
-    global_parent = _find_global_pinned_parent(items)
-
-    return spaces, global_parent, items
-
-
-def _find_global_pinned_parent(items: dict) -> str | None:
-    """Find the container that holds cross-space pinned tabs (no parentID)."""
-    for iid, item in items.items():
-        if item.get("parentID") is None and "itemContainer" in item.get("data", {}):
-            children = item.get("childrenIds", [])
-            if children:
-                return iid
-    return None
-
-
-def collect_tabs(item_id: str, items: dict) -> list[dict]:
+def collect(item_id, items):
     item = items.get(item_id)
     if not item:
         return []
     tabs = []
-    data = item.get("data", {})
-    if "tab" in data:
-        t = data["tab"]
+    if "tab" in item.get("data", {}):
+        t = item["data"]["tab"]
         url = t.get("savedURL", "")
         title = item.get("title") or t.get("savedTitle", url)
         if url:
-            tabs.append({"title": title or url, "url": url})
-    for child_id in item.get("childrenIds", []):
-        tabs.extend(collect_tabs(child_id, items))
+            tabs.append({"url": url, "title": title or url})
+    for child in item.get("childrenIds", []):
+        tabs.extend(collect(child, items))
     return tabs
 
+def hex_color(r, g, b):
+    return "#{:02X}{:02X}{:02X}".format(
+        int(max(0, min(1, r)) * 255),
+        int(max(0, min(1, g)) * 255),
+        int(max(0, min(1, b)) * 255),
+    )
 
-def srgb_to_hex(r: float, g: float, b: float) -> str:
-    r, g, b = max(0.0, min(1.0, r)), max(0.0, min(1.0, g)), max(0.0, min(1.0, b))
-    return "#{:02X}{:02X}{:02X}".format(int(r * 255), int(g * 255), int(b * 255))
-
-
-def arc_space_meta(space: dict) -> tuple[str, list[str]]:
-    """Return (emoji, [color1, color2]) for a space."""
-    info = space.get("customInfo", {})
-    emoji = info.get("iconType", {}).get("emoji_v2", "")
-    palette = info.get("windowTheme", {}).get("primaryColorPalette", {})
-    mid = palette.get("midTone", {})
-    r, g, b = mid.get("red", 0.5), mid.get("green", 0.5), mid.get("blue", 0.5)
-    color = srgb_to_hex(r, g, b)
-    dark = srgb_to_hex(r * 0.7, g * 0.7, b * 0.7)
-    return emoji, [color, dark]
-
-
-# ── Tab construction ──────────────────────────────────────────────────────────
-
-_counter = 0
-
-def _next_id() -> int:
-    global _counter
-    _counter += 1
-    return _counter
-
-def make_zen_tab(
-    url: str,
-    title: str,
-    now_ms: int,
-    workspace_uuid: str | None = None,
-    pinned: bool = False,
-    essential: bool = False,
-) -> dict:
-    n = _next_id()
+_n = 0
+def make_tab(url, title, now, workspace=None, pinned=False, essential=False):
+    global _n
+    _n += 1
     t = {
-        "entries": [{
-            "url": url,
-            "title": title,
-            "cacheKey": 0,
-            "ID": n,
-            "docshellUUID": "{" + str(uuid.uuid4()) + "}",
-            "originalURI": url,
-            "resultPrincipalURI": None,
-            "hasUserInteraction": False,
-            "triggeringPrincipal_base64": "{\"3\":{}}",
-            "docIdentifier": n,
-        }],
-        "lastAccessed": now_ms,
-        "hidden": False,
-        "zenSyncId": f"{now_ms}-{n}",
-        "zenEssential": essential,
-        "pinned": pinned,
-        "zenDefaultUserContextId": None,
-        "zenPinnedIcon": None,
-        "zenIsEmpty": False,
-        "zenHasStaticIcon": False,
-        "zenGlanceId": None,
-        "zenIsGlance": False,
-        "zenLiveFolderItemId": None,
-        "searchMode": None,
-        "userContextId": 0,
-        "attributes": {},
-        "index": 1,
-        "requestedIndex": 0,
-        "image": None,
+        "entries": [{"url": url, "title": title, "cacheKey": 0, "ID": _n,
+                     "docshellUUID": "{" + str(uuid.uuid4()) + "}",
+                     "originalURI": url, "resultPrincipalURI": None,
+                     "hasUserInteraction": False,
+                     "triggeringPrincipal_base64": "{\"3\":{}}",
+                     "docIdentifier": _n}],
+        "lastAccessed": now, "hidden": False,
+        "zenSyncId": f"{now}-{_n}", "zenEssential": essential,
+        "pinned": pinned, "zenDefaultUserContextId": None,
+        "zenPinnedIcon": None, "zenIsEmpty": False, "zenHasStaticIcon": False,
+        "zenGlanceId": None, "zenIsGlance": False, "zenLiveFolderItemId": None,
+        "searchMode": None, "userContextId": 0, "attributes": {},
+        "index": 1, "requestedIndex": 0, "image": None,
     }
-    if workspace_uuid:
-        t["zenWorkspace"] = workspace_uuid
+    if workspace:
+        t["zenWorkspace"] = workspace
     return t
 
+def run(arc_path, zen_path, dry_run=False, overwrite=False, verbose=False):
+    print(f"Arc  {arc_path}")
+    print(f"Zen  {zen_path}\n")
 
-# ── Migration ─────────────────────────────────────────────────────────────────
+    # Parse Arc
+    with open(arc_path) as f:
+        arc = json.load(f)
+    sidebar = arc["sidebar"]["containers"][1]
+    items = parse_items(sidebar["items"])
+    arc_spaces = [e for e in sidebar["spaces"] if isinstance(e, dict)]
 
-def migrate(
-    arc_path: Path,
-    zen_profile: Path,
-    dry_run: bool = False,
-    skip_existing: bool = True,
-    verbose: bool = False,
-) -> None:
-    print(f"Arc  → {arc_path}")
-    print(f"Zen  → {zen_profile}")
-    print()
+    # Find global pinned parent (no parentID, has itemContainer, has children)
+    global_parent = next(
+        (iid for iid, item in items.items()
+         if item.get("parentID") is None
+         and "itemContainer" in item.get("data", {})
+         and item.get("childrenIds")),
+        None
+    )
 
-    arc_spaces, global_parent, items = parse_arc(arc_path)
+    # Read Zen session
+    zs_path = zen_path / "zen-sessions.jsonlz4"
+    ss_path = zen_path / "sessionstore.jsonlz4"
+    zs_magic, zs = read_lz4(zs_path)
 
-    zs_path = zen_profile / "zen-sessions.jsonlz4"
-    ss_path = zen_profile / "sessionstore.jsonlz4"
-    recovery_path = zen_profile / "sessionstore-backups/recovery.jsonlz4"
+    existing = {s["name"] for s in zs.get("spaces", [])}
+    space_map = {s["name"]: s["uuid"] for s in zs.get("spaces", [])}
 
-    zs_magic, zs = read_mozlz4(zs_path)
-    ss_magic, ss = read_mozlz4(ss_path)
-
-    existing_names = {s["name"] for s in zs.get("spaces", [])}
-
-    if dry_run:
-        print("[dry-run] No files will be written.\n")
-
-    # ── Backup ────────────────────────────────────────────────────────────────
+    # Backup
     if not dry_run:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_dir = zen_profile / f"arc2zen-backup-{ts}"
-        backup_dir.mkdir()
-        shutil.copy2(zs_path, backup_dir / "zen-sessions.jsonlz4")
-        shutil.copy2(ss_path, backup_dir / "sessionstore.jsonlz4")
-        print(f"Backed up existing session → {backup_dir.name}/\n")
+        bdir = zen_path / f"arc2zen-backup-{ts}"
+        bdir.mkdir()
+        shutil.copy2(zs_path, bdir)
+        if ss_path.exists():
+            shutil.copy2(ss_path, bdir)
+        print(f"Backup saved → {bdir.name}/\n")
 
-    # ── Build spaces ──────────────────────────────────────────────────────────
+    now = int(time.time() * 1000)
     new_spaces = list(zs.get("spaces", []))
-    space_uuid_map: dict[str, str] = {s["name"]: s["uuid"] for s in new_spaces}
+    added = []
 
-    spaces_added = []
-    spaces_skipped = []
-
-    for arc_space in arc_spaces:
-        name = arc_space.get("title", "Imported")
-        if skip_existing and name in existing_names:
-            spaces_skipped.append(name)
+    for s in arc_spaces:
+        name = s.get("title", "Imported")
+        if not overwrite and name in existing:
+            print(f"  skip  {name} (already exists)")
             continue
-
-        space_uuid = "{" + str(uuid.uuid4()) + "}"
-        space_uuid_map[name] = space_uuid
-        emoji, colors = arc_space_meta(arc_space)
-
-        space_obj: dict = {
-            "uuid": space_uuid,
-            "name": name,
-            "theme": {
-                "type": "gradient",
-                "gradientColors": colors,
-                "opacity": 0.5,
-                "texture": 0,
-            },
-            "containerTabId": 0,
-            "hasCollapsedPinnedTabs": False,
-        }
+        sid = "{" + str(uuid.uuid4()) + "}"
+        space_map[name] = sid
+        info = s.get("customInfo", {})
+        emoji = info.get("iconType", {}).get("emoji_v2", "")
+        mid = info.get("windowTheme", {}).get("primaryColorPalette", {}).get("midTone", {})
+        r, g, b = mid.get("red", 0.5), mid.get("green", 0.5), mid.get("blue", 0.5)
+        c1, c2 = hex_color(r, g, b), hex_color(r * 0.7, g * 0.7, b * 0.7)
+        obj = {"uuid": sid, "name": name,
+               "theme": {"type": "gradient", "gradientColors": [c1, c2], "opacity": 0.5, "texture": 0},
+               "containerTabId": 0, "hasCollapsedPinnedTabs": False}
         if emoji:
-            space_obj["icon"] = emoji
+            obj["icon"] = emoji
+        new_spaces.append(obj)
+        added.append(name)
 
-        new_spaces.append(space_obj)
-        spaces_added.append(name)
+    # Build tabs
+    tabs = []
+    global_tabs = collect(global_parent, items) if global_parent else []
+    for t in global_tabs:
+        tabs.append(make_tab(t["url"], t["title"], now, essential=True, pinned=True))
+    print(f"Essential (all spaces): {len(global_tabs)}")
 
-    # ── Build tabs ────────────────────────────────────────────────────────────
-    now_ms = int(time.time() * 1000)
-    new_tabs: list[dict] = []
-
-    # Global essential tabs (shown across all spaces)
-    global_tabs = collect_tabs(global_parent, items) if global_parent else []
-    for tab in global_tabs:
-        new_tabs.append(make_zen_tab(tab["url"], tab["title"], now_ms, essential=True, pinned=True))
-
-    # Per-space tabs
-    tab_summary: dict[str, tuple[int, int]] = {}
-    for arc_space in arc_spaces:
-        name = arc_space.get("title", "")
-        space_uuid = space_uuid_map.get(name)
-        if not space_uuid:
+    for s in arc_spaces:
+        name = s.get("title", "")
+        sid = space_map.get(name)
+        if not sid:
             continue
-
-        cids = arc_space.get("containerIDs", [])
-        containers: dict[str, str] = {}
+        cids = s.get("containerIDs", [])
+        containers = {}
         for i, cid in enumerate(cids):
             if isinstance(cid, str) and len(cid) > 20:
-                label = cids[i - 1] if i > 0 and isinstance(cids[i - 1], str) and len(cids[i - 1]) < 20 else "unpinned"
+                label = cids[i-1] if i > 0 and len(cids[i-1]) < 20 else "unpinned"
                 containers[label] = cid
-
-        pinned_tabs = collect_tabs(containers.get("pinned", ""), items)
-        unpinned_tabs = collect_tabs(containers.get("unpinned", ""), items)
-        tab_summary[name] = (len(pinned_tabs), len(unpinned_tabs))
-
-        for tab in pinned_tabs:
-            new_tabs.append(make_zen_tab(tab["url"], tab["title"], now_ms, workspace_uuid=space_uuid, pinned=True))
-        for tab in unpinned_tabs:
-            new_tabs.append(make_zen_tab(tab["url"], tab["title"], now_ms, workspace_uuid=space_uuid, pinned=False))
-
-    # ── Print summary ─────────────────────────────────────────────────────────
-    if spaces_skipped:
-        print(f"Skipped (already exist): {', '.join(spaces_skipped)}")
-
-    print(f"Essential tabs (all spaces): {len(global_tabs)}")
-    if verbose:
-        for t in global_tabs:
-            print(f"  ⭐ {t['title']}")
-    print()
-
-    for name in spaces_added:
-        pinned, unpinned = tab_summary.get(name, (0, 0))
-        emoji, _ = arc_space_meta(next(s for s in arc_spaces if s.get("title") == name))
+        pinned = collect(containers.get("pinned", ""), items)
+        unpinned = collect(containers.get("unpinned", ""), items)
+        emoji = s.get("customInfo", {}).get("iconType", {}).get("emoji_v2", "")
         icon = f"{emoji} " if emoji else ""
-        print(f"  {icon}{name}: {pinned} pinned, {unpinned} unpinned")
+        print(f"  {icon}{name}: {len(pinned)} pinned  {len(unpinned)} unpinned")
         if verbose:
-            space_uuid = space_uuid_map[name]
-            for tab in new_tabs:
-                if tab.get("zenWorkspace") == space_uuid:
-                    pin = "📌" if tab["pinned"] else "  "
-                    print(f"    {pin} {tab['entries'][0]['title'][:60]}")
-    print()
+            for t in pinned:
+                print(f"    📌 {t['title'][:70]}")
+            for t in unpinned:
+                print(f"       {t['title'][:70]}")
+        for t in pinned:
+            tabs.append(make_tab(t["url"], t["title"], now, workspace=sid, pinned=True))
+        for t in unpinned:
+            tabs.append(make_tab(t["url"], t["title"], now, workspace=sid))
 
-    # ── Write ─────────────────────────────────────────────────────────────────
+    print(f"\n{len(new_spaces)} spaces  {len(tabs)} tabs")
+
     if dry_run:
-        print(f"[dry-run] Would write {len(new_spaces)} spaces, {len(new_tabs)} tabs.")
+        print("\n[dry-run] Nothing written.")
         return
 
-    # Remove old tabs for spaces we're re-importing
-    old_uuids = {space_uuid_map[n] for n in spaces_added if n in space_uuid_map}
-    existing_tabs = [t for t in zs.get("tabs", []) if t.get("zenWorkspace") not in old_uuids]
-    # Also strip old essential tabs if we have new ones
-    if global_tabs:
-        existing_tabs = [t for t in existing_tabs if not t.get("zenEssential")]
-    all_tabs = existing_tabs + new_tabs
-
-    # zen-sessions.jsonlz4
+    # Write zen-sessions.jsonlz4
     zs["spaces"] = new_spaces
-    zs["tabs"] = all_tabs
-    zs["lastCollected"] = now_ms
-    write_mozlz4(zs_path, zs_magic, zs)
+    zs["tabs"] = tabs
+    zs["lastCollected"] = now
+    write_lz4(zs_path, zs_magic, zs)
 
-    # sessionstore.jsonlz4
+    # Write sessionstore.jsonlz4 (create if missing)
+    if ss_path.exists():
+        ss_magic, ss = read_lz4(ss_path)
+    else:
+        ss_magic = MAGIC
+        ss = {"version": ["sessionrestore", 1], "selectedWindow": 1,
+              "_closedWindows": [], "session": {"lastUpdate": now, "startTime": now, "recentCrashes": 0},
+              "global": {}, "windows": []}
+
+    if not ss.get("windows"):
+        ss["windows"] = [{}]
     w = ss["windows"][0]
-    w["spaces"] = new_spaces
-    w["tabs"] = all_tabs
-    w["selected"] = 1
-    w["activeZenSpace"] = space_uuid_map.get(spaces_added[0]) if spaces_added else w.get("activeZenSpace")
-    write_mozlz4(ss_path, ss_magic, ss)
+    w.update({"tabs": tabs, "spaces": new_spaces, "selected": 1,
+              "activeZenSpace": space_map.get(added[0]) if added else w.get("activeZenSpace"),
+              "_closedTabs": w.get("_closedTabs", []), "groups": w.get("groups", []),
+              "closedGroups": w.get("closedGroups", []), "splitViewData": w.get("splitViewData", {}),
+              "folders": w.get("folders", [])})
+    write_lz4(ss_path, ss_magic, ss)
 
-    # recovery
-    if recovery_path.exists():
-        rec_magic, rec = read_mozlz4(recovery_path)
+    # Sync recovery
+    rec_path = zen_path / "sessionstore-backups/recovery.jsonlz4"
+    if rec_path.exists():
+        rec_magic, rec = read_lz4(rec_path)
         if rec.get("windows"):
-            rec["windows"][0]["spaces"] = new_spaces
-            rec["windows"][0]["tabs"] = all_tabs
-            rec["windows"][0]["selected"] = 1
-        write_mozlz4(recovery_path, rec_magic, rec)
+            rec["windows"][0].update({"tabs": tabs, "spaces": new_spaces, "selected": 1})
+        write_lz4(rec_path, rec_magic, rec)
 
-    print(f"Written {len(new_spaces)} spaces and {len(all_tabs)} tabs.")
-    print("Open Zen to see your spaces.")
+    print("\nDone. Open Zen.")
 
+def main():
+    p = argparse.ArgumentParser(description="Migrate Arc spaces and tabs to Zen Browser.")
+    p.add_argument("--arc", help="Path to Arc's StorableSidebar.json")
+    p.add_argument("--zen", help="Path to Zen profile directory")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--overwrite", action="store_true", help="Re-import spaces that already exist")
+    p.add_argument("--verbose", "-v", action="store_true")
+    args = p.parse_args()
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="arc2zen",
-        description="Migrate Arc Browser spaces and tabs to Zen Browser.",
-    )
-    parser.add_argument("--arc", metavar="PATH", help="Path to Arc's StorableSidebar.json (auto-detected on macOS)")
-    parser.add_argument("--zen", metavar="PATH", help="Path to Zen profile directory (auto-detected on macOS)")
-    parser.add_argument("--dry-run", action="store_true", help="Preview without writing anything")
-    parser.add_argument("--overwrite", action="store_true", help="Re-import spaces that already exist in Zen")
-    parser.add_argument("--verbose", "-v", action="store_true", help="List every tab being migrated")
-    args = parser.parse_args()
-
-    try:
-        arc_path = Path(args.arc) if args.arc else find_arc_sidebar()
-        zen_profile = Path(args.zen) if args.zen else find_zen_profile()
-    except FileNotFoundError as e:
-        sys.exit(f"Error: {e}")
-
-    try:
-        migrate(
-            arc_path=arc_path,
-            zen_profile=zen_profile,
-            dry_run=args.dry_run,
-            skip_existing=not args.overwrite,
-            verbose=args.verbose,
-        )
-    except Exception as e:
-        sys.exit(f"Migration failed: {e}")
-
+    arc = Path(args.arc) if args.arc else find_arc()
+    zen = Path(args.zen) if args.zen else find_zen()
+    run(arc, zen, dry_run=args.dry_run, overwrite=args.overwrite, verbose=args.verbose)
 
 if __name__ == "__main__":
     main()
